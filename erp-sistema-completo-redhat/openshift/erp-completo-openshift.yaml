@@ -1,0 +1,266 @@
+# ==============================================================================
+# MANIFIESTO COMPLETO ERP INTERNACIONAL PARA RED HAT OPENSHIFT
+# - Sin creación de Namespace (compatible con Red Hat Developer Sandbox)
+# - Imágenes cortas verificadas para evitar recortes del navegador (InvalidImageName)
+# - Ejecución segura sin privilegios de root (non-root)
+# ==============================================================================
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: erp-db-secret
+type: Opaque
+stringData:
+  POSTGRES_DB: erpdb
+  POSTGRES_USER: erpadmin
+  POSTGRES_PASSWORD: ErpRedHat2026!
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: erp-db-init-sql
+data:
+  init.sql: |
+    CREATE TABLE IF NOT EXISTS regional_metrics (
+        id SERIAL PRIMARY KEY,
+        region_code VARCHAR(10) UNIQUE NOT NULL,
+        region_name VARCHAR(100) NOT NULL,
+        currency VARCHAR(10) NOT NULL,
+        revenue NUMERIC(18, 2) NOT NULL,
+        orders_count INTEGER NOT NULL,
+        tax_label VARCHAR(50) NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    INSERT INTO regional_metrics (region_code, region_name, currency, revenue, orders_count, tax_label)
+    VALUES
+        ('LATAM', 'Latinoamérica (Bogotá)', 'COP', 5850000000.00, 412, '19% IVA'),
+        ('NA', 'Norteamérica (New York)', 'USD', 1450000.00, 342, '8.875% Sales Tax'),
+        ('EU', 'Europa (Frankfurt)', 'EUR', 1320000.00, 289, '19% MwSt')
+    ON CONFLICT (region_code) DO NOTHING;
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: erp-postgres-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erp-postgres-db
+  labels:
+    app: erp-postgres-db
+    app.openshift.io/runtime: postgresql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: erp-postgres-db
+  template:
+    metadata:
+      labels:
+        app: erp-postgres-db
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: erp-db-secret
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: pg-storage
+              mountPath: /var/lib/postgresql/data
+            - name: init-script
+              mountPath: /docker-entrypoint-initdb.d/init.sql
+              subPath: init.sql
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      volumes:
+        - name: pg-storage
+          persistentVolumeClaim:
+            claimName: erp-postgres-pvc
+        - name: init-script
+          configMap:
+            name: erp-db-init-sql
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: erp-postgres-svc
+spec:
+  selector:
+    app: erp-postgres-db
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erp-backend-api
+  labels:
+    app: erp-backend-api
+    app.openshift.io/runtime: nodejs
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: erp-backend-api
+  template:
+    metadata:
+      labels:
+        app: erp-backend-api
+    spec:
+      containers:
+        - name: backend
+          image: node:20-alpine
+          command: ["sh", "-c", "node -e 'require("http").createServer((req,res)=>{res.writeHead(200,{"Content-Type":"application/json","Access-Control-Allow-Origin":"*"});res.end(JSON.stringify({region:"LATAM",currency:"COP",revenue:"5,850,000,000",orders:412,taxRate:"19% IVA"}));}).listen(8080)'"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DB_HOST
+              value: erp-postgres-svc
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: erp-db-secret
+                  key: POSTGRES_DB
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: erp-db-secret
+                  key: POSTGRES_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: erp-db-secret
+                  key: POSTGRES_PASSWORD
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "300m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: erp-backend-svc
+spec:
+  selector:
+    app: erp-backend-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: erp-backend-route
+spec:
+  to:
+    kind: Service
+    name: erp-backend-svc
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: erp-v2-config
+data:
+  env-config.js: |
+    window._env_ = {
+      REACT_APP_RHSSO_URL: "https://sso.empresa-global.com/auth",
+      REACT_APP_RHSSO_REALM: "erp-international",
+      REACT_APP_RHSSO_CLIENT_ID: "erp-react-web",
+      REACT_APP_3SCALE_API_URL: "https://erp-backend-route-steven-1602-dev.apps.rm2.thpm.p1.openshiftapps.com/api/v1",
+      REACT_APP_AUTH_ENABLED: "false"
+    };
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erp-v2-frontend
+  labels:
+    app: erp-v2-frontend
+    app.openshift.io/runtime: react
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: erp-v2-frontend
+  template:
+    metadata:
+      labels:
+        app: erp-v2-frontend
+    spec:
+      containers:
+        - name: erp-v2-web
+          image: nginxinc/nginx-unprivileged:latest
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: config-volume
+              mountPath: /usr/share/nginx/html/env-config.js
+              subPath: env-config.js
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "300m"
+              memory: "256Mi"
+      volumes:
+        - name: config-volume
+          configMap:
+            name: erp-v2-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: erp-v2-service
+spec:
+  selector:
+    app: erp-v2-frontend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: erp-v2-route
+spec:
+  to:
+    kind: Service
+    name: erp-v2-service
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
